@@ -1,0 +1,147 @@
+---
+title: "Differential Expression Analysis"
+date: "Created: 2021-08-17 Updated: `r Sys.Date()`"
+output: 
+  html_notebook:
+    codes: hide
+---
+
+### Introdution
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = F, message = F)
+library(dplyr)
+library(tibble)
+library(ggplot2)
+library(convert)
+library(limma)
+
+# rm(list = ls())
+options(stringsAsFactors = F)
+options(future.globals.maxSize = 1000 * 1024^2)
+
+grp <- c("Normal", "Tumor")
+grp.col <- c("#568875", "#73FAFC")
+```
+
+
+### Importing Data 
+```{r}
+HNSC_ExprSet <- readRDS("../../Study/SeqData/TCGA_HNSC/Clean/TCGA-HNSC-post_mRNA_ExprSet.RDS")
+HNSC_ExprSet
+```
+
+
+### Differential Expression Analysis
+```{r}
+get_DiffGene_limma <- function(dataset=HNSC_ExprSet,
+                               group_name=grp,
+                               fc=0.585,
+                               Pval=0.05){
+
+  # dataset=HNSC_ExprSet
+  # group_name=grp
+  # fc=0.585
+  # Pval=0.05
+  
+  pheno <- pData(dataset) %>% filter(Group%in%group_name)
+  pheno$Group <- factor(as.character(pheno$Group), levels = group_name)
+  
+  design <- model.matrix(~0 + pheno$Group)
+  rownames(design) <- rownames(pheno)
+  colnames(design) <- group_name
+
+  # show distribution
+  edata <- as.matrix(exprs(dataset))
+  exprSet <- edata[, colnames(edata)%in%rownames(pheno)]  
+
+  # linear fitting 
+  limma_voom <- voom(exprSet, design, plot = TRUE)
+  fit <- lmFit(limma_voom, design)
+  
+  # contrast group for unpaired test  
+  group <- paste(group_name, collapse = "-")
+  contrast <- makeContrasts(contrasts = "Normal-Tumor",
+                            levels    = design) 
+  print(contrast)
+  # eBayes
+  fit2 <- contrasts.fit(fit, contrast)
+  fit2 <- eBayes(fit2)
+    
+  # differential features
+  diff_gene <- topTable(fit2, number = Inf, adjust.method = 'BH', coef = 1) %>%
+      rownames_to_column("GeneID") 
+    
+  # validate the enriched directory
+  pl <- data.frame(edata)[rownames(data.frame(edata))%in%diff_gene$GeneID[1], , F] %>% 
+      t() %>% data.frame() %>%
+      setNames("Gene") %>%
+      rownames_to_column("SampleID") %>%
+      inner_join(pheno%>% dplyr::select(-SampleID) %>% rownames_to_column("SampleID"), by = "SampleID") %>%
+    ggplot(aes(x=Group, y=Gene))+
+      geom_boxplot()+
+      labs(y=diff_gene$GeneID[1], x="")+
+      ggpubr::stat_compare_means(method = "wilcox.test",
+                                 comparisons = list(group_name))+
+      theme_bw()
+  print(pl)
+  
+  # enriched directory: It is sometimes useful to check things by hand to make sure you have the right interpretation.
+  for(i in 1:5){
+    typeMean <- tapply(limma_voom$E[diff_gene$GeneID[i], ], pheno$Group, mean)
+    deltaMean <- as.numeric(typeMean[group_name[2]] - typeMean[group_name[1]])
+    logFC <- diff_gene[diff_gene$GeneID%in%diff_gene$GeneID[i], "logFC"]
+    cat(paste0(diff_gene$GeneID[i], ": ", paste(rev(group_name), collapse = "-"), " = ", signif(deltaMean, 3)))
+    cat("\n")
+    cat(paste0(diff_gene$GeneID[i], ": ", "logFC = ", signif(logFC, 3))) 
+    cat("\n")
+  }
+
+  if((deltaMean > 0 & logFC > 0) | (deltaMean < 0 & logFC < 0)){
+    diff_gene[which(diff_gene$logFC >= fc & diff_gene$adj.P.Val < Pval), "Enrichment"] <- group_name[2]
+    diff_gene[which(diff_gene$logFC <= -fc & diff_gene$adj.P.Val < Pval), "Enrichment"] <- group_name[1]
+    diff_gene[which(abs(diff_gene$logFC) < fc | diff_gene$adj.P.Val >= Pval), "Enrichment"] <- "Nonsignif"     
+  }else if((deltaMean > 0 & logFC < 0) | (deltaMean < 0 & logFC > 0)){
+    diff_gene[which(diff_gene$logFC >= fc & diff_gene$adj.P.Val < Pval), "Enrichment"] <- group_name[1]
+    diff_gene[which(diff_gene$logFC <= -fc & diff_gene$adj.P.Val < Pval), "Enrichment"] <- group_name[2]
+    diff_gene[which(abs(diff_gene$logFC) < fc | diff_gene$adj.P.Val >= Pval), "Enrichment"] <- "Nonsignif"     
+  }
+   
+  
+  # Number & Block
+  dat_status <- table(pheno$Group)
+  dat_status_number <- as.numeric(dat_status)
+  dat_status_name <- names(dat_status)
+  diff_gene$Block <- paste(paste(dat_status_number[1], dat_status_name[1], sep = "_"),
+                         "vs",
+                         paste(dat_status_number[2], dat_status_name[2], sep = "_"))
+  
+  res <- diff_gene %>% dplyr::select(GeneID, Block, logFC, adj.P.Val, Enrichment, everything()) %>%
+    arrange(adj.P.Val, logFC) 
+  
+  print(dim(res %>% filter(Enrichment != "Nonsignif")))
+  
+  return(res)
+}
+
+
+DEA_res <- get_DiffGene_limma(dataset=HNSC_ExprSet, fc=0.585, Pval=0.05)
+table(DEA_res$Enrichment)
+if(!dir.exists("../../Result/Differential/")){
+  dir.create("../../Result/Differential/")
+}
+write.csv(DEA_res, "../../Result/Differential/HNSC_limma_gene.csv", row.names = F)
+
+table(DEA_res$Enrichment)
+```
+
+
+### systemic information
+```{r}
+sessionInfo()
+```
+
+
+### Reference
+
+1. [RNA-seq摸索：4. edgeR/limma/DESeq2差异基因分析](https://www.jianshu.com/p/bdf2b72b8761)
+

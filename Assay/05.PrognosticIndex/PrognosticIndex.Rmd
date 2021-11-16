@@ -1,0 +1,322 @@
+---
+title: "IRGPI: Construction and validation of the immune-related gene prognostic index"
+date: "Created: 2021-09-02 Updated: `r Sys.Date()`"
+output: 
+  html_notebook:
+    codes: hide
+---
+
+### Introdution
+
+The IRGPI of each sample was calculated by multiplying the expression values of certain genes by their weight in the Cox model and then adding them together.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = F, message = F)
+library(dplyr)
+library(tibble)
+library(convert)
+library(data.table)
+library(ggplot2)
+library(survival)
+
+# rm(list = ls())
+options(stringsAsFactors = F)
+options(future.globals.maxSize = 1000 * 1024^2)
+
+grp <- c("Normal", "Tumor")
+grp.col <- c("#568875", "#73FAFC")
+```
+
+
+### Importing Data 
+```{r}
+HNSC_ExprSet_Immune <- readRDS("../../Result/Profile/HNSC_ExprSet_ImmuneGene.RDS")
+HNSC_ExprSet_Immune
+
+HNSC_SurHubGene <- fread("../../Result/Survival/HNSC_SurHubGene.csv")
+
+HNSC_clinical <- fread("../../Study/SeqData/TCGA_HNSC/Clinical/TCGA-HNSC-post_clinical.csv")
+```
+
+
+### Cox Proportional-Hazards Model & Prognosic index
+```{r}
+Cox_ProIndex <- function(dataset=HNSC_ExprSet_Immune,
+                    datagene=HNSC_SurHubGene,
+                    metadata=HNSC_clinical,
+                    Pval=0.1){
+
+  # dataset=HNSC_ExprSet_Immune
+  # datagene=HNSC_SurHubGene
+  # Pval=0.1
+  # metadata=HNSC_clinical
+
+  phen <- pData(dataset)
+  prof <- exprs(dataset)
+  feature <- datagene %>% filter(Status != "Discard")
+
+  fid <- intersect(rownames(prof), feature$GeneID)
+  prof_cln <- prof[rownames(prof)%in%fid, ] %>%
+    t() %>% data.frame() %>%
+    rownames_to_column("Barcode")
+
+  mdat <- phen %>% rownames_to_column("Barcode") %>%
+    filter(Group != grp[1]) %>%
+    dplyr::select(Barcode, OS, OS.Time) %>%
+    inner_join(prof_cln, by = "Barcode") %>%
+    mutate(Barcode=gsub("_01A|_01B|_06A", "", Barcode))
+  
+  # deduplicated samples
+  pid <- intersect(metadata$Barcode, mdat$Barcode)
+  mdat_cln <- mdat[pmatch(pid, mdat$Barcode), ]
+  clinical_cln <- metadata[pmatch(pid, metadata$Barcode), ]
+  print(dim(mdat_cln))
+  
+  datphe <- mdat_cln %>% dplyr::select(OS.Time, OS) 
+  datprf <- mdat_cln %>% dplyr::select(colnames(prof_cln))
+  rownames(datprf) <- NULL
+
+  covariates <- colnames(datprf)[-1]
+  univ_formulas <- sapply(covariates, function(x){as.formula(paste("Surv(OS.Time, OS)~", x))})
+  univ_models <- lapply(univ_formulas, function(x){coxph(x, data = mdat_cln)})
+
+  # Extract data
+  univ_results <- lapply(univ_models,
+                         function(x){
+                            x <- summary(x)
+                            p.value <- signif(x$wald["pvalue"], digits=4)
+                            wald.test <- signif(x$wald["test"], digits=4)
+                            beta <- signif(x$coef[1], digits=4) #coeficient beta
+                            HR <-signif(x$coef[2], digits=2) #exp(beta)
+                            HR_lower <- signif(x$conf.int[, "lower .95"], 2)
+                            HR_upper <- signif(x$conf.int[, "upper .95"], 2)
+                            HR_95 <- paste0(HR, " (", HR_lower, "-", HR_upper, ")")
+                            res <- c(beta, HR_95, HR, HR_lower, HR_upper, wald.test, p.value)
+                            names(res) <- c("beta", "HR(95% CI)", "HR_mean", 
+                                            "HR_lower", "HR_upper",
+                                            "wald.test", "P.Value")
+                            return(res)
+                           })
+  res_cox <- t(as.data.frame(univ_results, check.names = FALSE)) %>%
+    data.frame() %>%
+    rownames_to_column("GeneID") 
+  
+  # prognostic index
+  gene_cox <- res_cox %>% 
+    mutate(P.Value=as.numeric(P.Value),
+           beta=as.numeric(beta)) %>%
+    filter(as.numeric(P.Value) < Pval) %>%
+    dplyr::select(GeneID, beta) %>%
+    column_to_rownames("GeneID") %>%
+    as.matrix()
+  
+  prf_index <- datprf %>% column_to_rownames("Barcode") %>%
+    dplyr::select(rownames(gene_cox)) %>%
+    as.matrix()
+  
+  Pindex <- prf_index %*% gene_cox %>%
+    data.frame() %>% setNames("Prognostic_Score") %>%
+    rownames_to_column("Barcode") %>%
+    inner_join(clinical_cln, by="Barcode")
+  
+  # Optimal cut-off value for prognostic index
+  Pindex_fit <- surv_cutpoint(data = Pindex,
+                         time = "OS.Time",
+                         event = "OS",
+                         variables = "Prognostic_Score")
+  Pindex_threshold <- as.numeric(summary(Pindex_fit))[1]
+  Pindex$IRGPI_group <- ifelse(Pindex$Prognostic_Score > Pindex_threshold, "IRGPI_high", "IRGPI_low")
+  
+  
+  # survival-associated immune-related hub genes with low and high cluster
+  sur_gene <- clinical_cln %>% 
+    inner_join(data.frame(prf_index) %>% 
+                 rownames_to_column("Barcode"), 
+               by = "Barcode") %>%
+    data.frame()
+  sur_gene_covariables <- rownames(gene_cox)
+  sur_gene__threshold <- lapply(sur_gene_covariables, function(x){
+    fit <- surv_cutpoint(data = sur_gene,
+                         time = "OS.Time",
+                         event = "OS",
+                         variables = x)
+    res <- as.numeric(summary(fit))
+    return(res)
+  }) %>% data.frame() %>% t() %>%
+    data.frame() %>%
+    setNames(c("cutpoint", "statistic"))
+  rownames(sur_gene__threshold) <- sur_gene_covariables  
+  df_group <- data.frame(matrix(NA, ncol=length(sur_gene_covariables), nrow=nrow(sur_gene)))
+  rownames(df_group) <- sur_gene$Barcode
+  colnames(df_group) <- paste0(sur_gene_covariables, "_group")
+  for(i in 1:length(sur_gene_covariables)){
+    gene_index <- which(colnames(sur_gene) == sur_gene_covariables[i])
+    gene_group <- paste0(sur_gene_covariables[i], c("_high", "_low"))
+    df_group[, i] <- ifelse(sur_gene[, gene_index] > sur_gene__threshold$cutpoint[i], 
+                            gene_group[2], gene_group[1])
+  }
+  
+  sur_gene_res <- inner_join(sur_gene, df_group %>% rownames_to_column("Barcode"),
+                             by = "Barcode")
+  
+  res <- list(cox=res_cox,
+              pindex=Pindex,
+              surprf=sur_gene_res)
+
+  return(res)
+}
+
+if(!dir.exists("../../Result/Survival")){
+  dir.create("../../Result/Survival", recursive = T)
+}
+
+Prognostic_Index <- Cox_ProIndex(
+                    dataset=HNSC_ExprSet_Immune,
+                    datagene=HNSC_SurHubGene,
+                    metadata=HNSC_clinical,
+                    Pval=0.1)
+
+write.csv(Prognostic_Index$cox, "../../Result/Survival/HNSC_SurHubGene_cox.csv", row.names = F)
+write.csv(Prognostic_Index$pindex, "../../Result/Survival/HNSC_SurHubGene_Pindex.csv", row.names = F)
+write.csv(Prognostic_Index$surprf, "../../Result/Survival/HNSC_SurHubGene_profile.csv", row.names = F)
+DT::datatable(Prognostic_Index$cox)
+DT::datatable(Prognostic_Index$pindex)
+```
+
+
+### Univariate Cox analysis of 21 immune-related hub genes
+```{r, fig.width=6, fig.height=8}
+library(forestplot)
+tabletext <- cbind(c(NA, "Hub genes", Prognostic_Index$cox$GeneID), 
+                   c(NA, "P-value", as.numeric(Prognostic_Index$cox$P.Value)),
+                   c(NA, "HR(95% CI)", Prognostic_Index$cox$HR.95..CI.))
+forestplot(labeltext=tabletext, 
+           graph.pos=2,                     
+           col=fpColors(box="#D55E00", lines="#CC79A7", zero="gray50"),
+           mean=c(NA, NA, as.numeric(Prognostic_Index$cox$HR_mean)),
+           lower=c(NA, NA, as.numeric(Prognostic_Index$cox$HR_lower)),
+           upper=c(NA, NA, as.numeric(Prognostic_Index$cox$HR_upper)),
+           boxsize=0.3,
+           lwd.ci=2,            
+           ci.vertices.height=0.08,
+           ci.vertices=TRUE,
+           zero=1,
+           lwd.zero=1,      
+           colgap=unit(5, "mm"),  
+           xticks=c(0.5, 1, 1.5), 
+           lwd.xaxis=1,          
+           lineheight=unit(.8, "cm"), 
+           graphwidth=unit(.3, "npc"), 
+           cex=0.9, 
+           fn.ci_norm=fpDrawCircleCI,           
+           hrzl_lines=list("3" =gpar(lwd=2, col="black"),  
+                           "24"=gpar(lwd=2, col="black")),
+           mar=unit(rep(0.5, times=4), "cm"),             
+           txt_gp=fpTxtGp(label=gpar(cex=1),                
+                          ticks=gpar(cex=1.5),
+                          xlab=gpar(cex=1.25),
+                          title=gpar(cex=1.2)),
+           xlab="Hazard Ratio")
+```
+
+**Notes: the three genes were SPINK5 NR3C2 AZGP1**
+
+
+### Kaplan-Meier survival analysis of the three genes significant in the univariate Cox analysis
+```{r}
+get_surplot <- function(dataset=Prognostic_Index$surprf, 
+                        group_name="SPINK5"){
+  
+  # dataset=Prognostic_Index$surprf
+  # group_name="SPINK5"
+  
+  # pvalue
+  colnames(dataset)[which(colnames(dataset) == paste0(group_name, "_group"))] <- "group_info"
+  print(table(dataset$group_info))
+  
+  dat_sur <- dataset %>% dplyr::select(OS.Time, OS, group_info) %>%
+    mutate(group_info=factor(group_info, levels = paste0(group_name, c("_high", "_low")))) 
+    
+  factors <- levels(dat_sur$group_info)
+  
+  cox <- coxph(Surv(OS.Time, OS) ~ group_info, data = dat_sur)
+  tmp <- summary(cox)
+  tmp.wald <- data.frame(t(tmp$waldtest)) %>%
+        setNames(c("Wald_test", "Wald_df", "Wald_pvlaue"))
+  tmp.lg <- data.frame(t(tmp$logtest)) %>%
+        setNames(c("lg_rank", "lg_rank_df", "lg_rank_pvlaue"))
+  tmp.total <- cbind(tmp.wald, tmp.lg) 
+  
+  pvalue <- paste(paste0("Log-Rank P=", signif(tmp.lg$lg_rank_pvlaue, 3)), 
+                  paste0("Cox P=", signif(tmp.wald$Wald_pvlaue, 3)), sep = "\n")
+  
+  # plot
+  fit <- survfit(Surv(OS.Time, OS) ~ group_info, data = dat_sur)
+  info <- data.frame(time = fit$time,
+                  n.risk = fit$n.risk,
+                  n.event = fit$n.event,
+                  n.censor = fit$n.censor,
+                  surv = fit$surv,
+                  upper = fit$upper,
+                  lower = fit$lower)
+  
+  pl <- ggsurvplot(fit,
+             data = dat_sur,  
+             surv.median.line = "hv",
+             add.all = FALSE,
+             palette = c("red", "blue"), #"aaas",
+             risk.table = TRUE, 
+             xlab = "Follow up time(Years)", 
+             legend = c(0.9, 0.4), 
+             legend.title = "",
+             legend.labs = factors, #c("all", factors), 
+             break.x.by = 2,
+             font.legend = c(10, "italic"),
+             ggtheme = theme_bw())
+  pl$plot <- pl$plot + 
+             annotate("text", x=3, y=0.2, label=pvalue)
+  
+  res <- list(info=info, pl=pl)
+  return(res)
+}
+```
+
+
+
+#### SPINK5
+```{r, fig.width=8, fig.height=6}
+get_surplot(dataset=Prognostic_Index$surprf, 
+            group_name="SPINK5")
+```
+
+
+#### NR3C2 
+```{r, fig.width=8, fig.height=6}
+get_surplot(dataset=Prognostic_Index$surprf, 
+            group_name="NR3C2")
+```
+
+
+#### AZGP1
+```{r, fig.width=8, fig.height=6}
+get_surplot(dataset=Prognostic_Index$surprf, 
+            group_name="AZGP1")
+```
+
+
+#### Prognostic score
+```{r, fig.width=8, fig.height=6}
+get_surplot(dataset=Prognostic_Index$pindex, 
+            group_name="IRGPI")
+```
+
+
+### systemic information
+```{r}
+sessionInfo()
+```
+
+
+### Reference
+
+1. [使用forestplot绘制森林图](https://cloud.tencent.com/developer/article/1654977)

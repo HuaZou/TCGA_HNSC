@@ -1,0 +1,76 @@
+---
+title: "Somatic mutations of immune-related hub genes"
+date: "Created: 2021-09-14 Updated: `r Sys.Date()`"
+output: 
+  html_notebook:
+    codes: hide
+---
+
+### Introdution
+
+To reveal relevant genetic alterations, somatic mutations of 22 immune-related hub genes were analyzed by using the ComplexHeatmap package of R.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = F, message = F)
+library(dplyr)
+library(tibble)
+library(convert)
+library(data.table)
+library(ggplot2)
+library(ComplexHeatmap)
+library(maftools)
+
+# rm(list = ls())
+options(stringsAsFactors = F)
+options(future.globals.maxSize = 1000 * 1024^2)
+
+grp <- c("Normal", "Tumor")
+grp.col <- c("#568875", "#73FAFC")
+```
+
+
+### Importing Data 
+```{r}
+phenotype <- read.csv("../../Study/SeqData/TCGA_HNSC/Clinical/TCGA-HNSC-post_clinical.csv")
+SurHubGene <- fread("../../Result/Survival/HNSC_SurHubGene.csv")
+SomaticMutation <- fread("../../Study/SeqData/TCGA_HNSC/Somatic_Mutation/TCGA-HNSC_mutect_somatic_maf.tsv")
+```
+
+
+### Filtering Gene by Survival hub genes
+```{r}
+dat <- SomaticMutation %>% filter(Hugo_Symbol%in%SurHubGene$GeneID) 
+datlam <- read.maf(maf = SomaticMutation)
+```
+
+
+### whole picture of somatic mutation
+```{r}
+plotmafSummary(maf = datlam, rmOutlier = TRUE, addStat = 'median', dashboard = TRUE, titvRaw = FALSE)
+```
+
+
+### oncoplot
+```{r, fig.width=10, fig.height=8}
+oncoplot(maf = datlam, top = 20)
+```
+
+
+### interaction among genes
+```{r}
+Interact <- somaticInteractions(maf = datlam, top = 20, pvalue = c(0.05, 0.1))
+Interact$gene_sets
+```
+
+
+### systemic information
+```{r}
+sessionInfo()
+```
+
+
+### Reference
+
+1. [maftools|TCGA肿瘤突变数据的汇总，分析和可视化](https://mp.weixin.qq.com/s?__biz=MzIyNDI1MzgzOQ==&mid=2650394616&idx=2&sn=92f512cef2a262a12eaec7992107ec03&chksm=f01cad18c76b240e69d50a64d20e20a65ed5926fcd838d2ad0dffb9549a62b172951a9cf4eec&scene=21#wechat_redirect)
+
+2. [maftools | 从头开始绘制发表级oncoplot（瀑布图）](https://mp.weixin.qq.com/s?__biz=MzIyNDI1MzgzOQ==&mid=2650394240&idx=1&sn=44b7769942c63fb94c2547a5ad5bb771&chksm=f01cac60c76b25766587c8af2338d06dc39646479d748f5a33ea2bb588251f719b21118a6c17&scene=21#wechat_redirect)

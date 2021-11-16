@@ -1,0 +1,41 @@
+---
+title: "Immune-related hub genes for TF, miRNA and lncRNA regulatory networks anlaysis"
+date: "Created: 2021-09-14 Updated: `r Sys.Date()`"
+output: 
+  html_notebook:
+    codes: hide
+---
+
+### Introdution
+
+Immune-related hub genes for TF, miRNA and lncRNA regulatory networks anlaysis
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = F, message = F)
+library(dplyr)
+library(tibble)
+library(data.table)
+
+# rm(list = ls())
+options(stringsAsFactors = F)
+options(future.globals.maxSize = 1000 * 1024^2)
+
+grp <- c("Normal", "Tumor")
+grp.col <- c("#568875", "#73FAFC")
+```
+
+
+### Importing Data 
+```{r}
+SurHubGene <- fread("../../Result/Survival/HNSC_SurHubGene.csv")
+```
+
+
+### systemic information
+```{r}
+sessionInfo()
+```
+
+
+### Reference
+

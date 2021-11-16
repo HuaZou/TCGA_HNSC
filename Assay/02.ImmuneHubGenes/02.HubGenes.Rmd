@@ -1,0 +1,674 @@
+---
+title: "WGCNA: Immune-related hub Differential Expression Genes"
+date: "Created: 2021-08-20 Updated: `r Sys.Date()`"
+output: 
+  html_notebook:
+    codes: hide
+---
+
+### Introdution
+
+The pricinpal steps of workflow are:
+
+1. Cleaning, preprocessing Expression data
+
+2. Constructing gene co-expression network
+
+3. Identifying modules
+
+4. Investigating modules related to external information
+
+5. Studying module relations via Eigengene Network
+
+6. Finding the key drivers in interesting modules
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = F, message = F)
+library(dplyr)
+library(tibble)
+library(convert)
+library(ggplot2)
+library(WGCNA)
+
+# rm(list = ls())
+options(stringsAsFactors = F)
+options(future.globals.maxSize = 1000 * 1024^2)
+
+grp <- c("Normal", "Tumor")
+grp.col <- c("#568875", "#73FAFC")
+```
+
+
+### Importing Data 
+```{r}
+HNSC_ExprSet_Immune <- readRDS("../../Result/Profile/HNSC_ExprSet_ImmuneGene.RDS")
+HNSC_ExprSet_Immune
+```
+
+
+### Checking data for excessive missing values and identication of outliers
+```{r}
+Check_fun <- function(dataset=HNSC_ExprSet_Immune){
+  
+  # dataset=HNSC_ExprSet_Immune
+  
+  phenotype <- pData(dataset)
+  profile <- exprs(dataset)
+  
+  prof <- profile %>% t() %>% data.frame()
+
+  gsg <- goodSamplesGenes(datExpr = prof, verbose = 3)
+  print(gsg$allOK)
+  if(!gsg$allOK){
+    # Optionally, print the gene and sample names that were removed:
+    if(sum(!gsg$goodGenes) > 0){
+      printFlush(paste("Removing genes:", paste(names(prof)[!gsg$goodGenes], collapse = ", ")))  
+    }
+    if(sum(!gsg$goodSamples) > 0){
+      printFlush(paste("Removing samples:", paste(rownames(prof)[!gsg$goodSamples], collapse = ", ")))    
+    }
+    # Remove the offending genes and samples from the data:
+    prof <- prof[gsg$goodSamples, gsg$goodGenes]
+  }
+  
+  # Matching the samples for which they were measured to the expression samples
+  sampleTree <- hclust(dist(prof), method = "average")
+  traitColors <- numbers2colors(phenotype %>% dplyr::select(Group, Age, Gender) %>%
+                                  mutate(Group=as.numeric(factor(Group)),
+                                         Gender=as.numeric(factor(Gender))), signed = FALSE)
+  plotDendroAndColors(sampleTree, traitColors,
+                      groupLabels = c("Group", "Age", "Gender"),
+                      main = "Sample dendrogram and trait heatmap")
+  
+  # Convert data into ExpressionSet
+  
+  sid <- intersect(rownames(prof), rownames(phenotype))
+  phen_cln <- phenotype[sid, ]
+  prof_cln <- prof %>% t() %>% data.frame() %>%
+    dplyr::select(rownames(phen_cln)) 
+  
+  if(!any(colnames(prof_cln) == rownames(phen_cln))){
+    stop("The order of samplenames between phen_cln and prof_cln was wrong")
+  }
+  
+  exprs <- as.matrix(prof_cln)
+  adf <-  new("AnnotatedDataFrame", data=phen_cln)
+  experimentData <- new("MIAME",
+          name="Hua Zou", lab="gdl Lab",
+          contact="zouhua1@outlook.com",
+          title="Tumor Experiment",
+          abstract="ExpressionSet",
+          url="www.zouhua.top",
+          other=list(notes="The Immune-related genes ExpressionSet"))
+  expressionSet <- new("ExpressionSet", exprs=exprs,
+                         phenoData=adf,
+                         experimentData=experimentData)
+  return(expressionSet)    
+}
+
+if(!dir.exists("../../Result/WGCNA")){
+  dir.create("../../Result/WGCNA", recursive = T)
+}
+
+ExprSet_check <- Check_fun(dataset=HNSC_ExprSet_Immune)
+ExprSet_check
+saveRDS(ExprSet_check, "../../Result/WGCNA/HNSC_ExprSet_ImmuneGene_check.RDS", compress = TRUE)
+
+datExpr <- t(exprs(ExprSet_check))  # columns are genes and rows are samples
+datTraits <- pData(ExprSet_check) %>% 
+  dplyr::select(Group, Age, Gender) %>%
+  mutate(Group=as.numeric(factor(Group)),
+         Gender=as.numeric(factor(Gender)))
+```
+
+
+### Constructing gene co-expression network
+
+#### Choose a set of soft-thresholding powers
+```{r, fig.width=8, fig.height=4}
+Powers_fun <- function(dataset=ExprSet_check){
+  
+  # dataset=ExprSet_check
+  
+  #phenotype <- pData(dataset)
+  profile <- exprs(dataset)  
+  
+  # Choose a set of soft-thresholding powers
+  powers <- c(c(1:10), seq(from=12, to=20, by=2))
+  sft <- pickSoftThreshold(data = t(profile), # Rows correspond to samples and columns to genes
+                           powerVector = powers,
+                           verbose = 5)
+  
+  
+  sizeGrWindow(9, 5)
+  par(mfrow = c(1,2))
+  # Scale-free topology fit index as a function of the soft-thresholding power
+  plot(sft$fitIndices[,1], 
+       -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+       xlab="Soft Threshold (power)",
+       ylab="Scale Free Topology Model Fit,signed R^2",
+       type="n",
+       main = paste("Scale independence"))
+  text(sft$fitIndices[,1], 
+       -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+       labels=powers,
+       cex=0.9,
+       col="red")
+  abline(h=0.90, col="red")
+  
+  # Mean connectivity as a function of the soft-thresholding power
+  plot(sft$fitIndices[,1], 
+       sft$fitIndices[,5],
+       xlab="Soft Threshold (power)",
+       ylab="Mean Connectivity", 
+       type="n",
+       main = paste("Mean connectivity"))
+  text(sft$fitIndices[,1], 
+       sft$fitIndices[,5], 
+       labels=powers, 
+       cex=0.9, 
+       col="red")
+}
+Powers_fun(dataset=ExprSet_check)
+```
+
+*We choose the power 12, which is the lowest power for which the scale-free topology fit index curve attens out upon reaching a high value.*
+
+#### One-step network construction and module detection
+```{r}
+if(0){
+  net <- blockwiseModules(datExpr = datExpr, 
+                          power = 5,
+                          TOMType = "unsigned", 
+                          minModuleSize = 30,
+                          reassignThreshold = 0, 
+                          mergeCutHeight = 0.25,
+                          numericLabels = TRUE, 
+                          pamRespectsDendro = FALSE,
+                          saveTOMs = TRUE,
+                          saveTOMFileBase = "../../Result/WGCNA/TOM",
+                          verbose = 3)
+  table(net$colors)
+  
+  # open a graphics window
+  sizeGrWindow(12, 9)
+  # Convert labels to colors for plotting
+  mergedColors <- labels2colors(net$colors)
+  # Plot the dendrogram and the module colors underneath
+  plotDendroAndColors(net$dendrograms[[1]], 
+                      mergedColors[net$blockGenes[[1]]],
+                      "Module colors",
+                      dendroLabels = FALSE, 
+                      hang = 0.03,
+                      addGuide = TRUE, 
+                      guideHang = 0.05)  
+}
+
+```
+
+
+#### Step-by-step network construction and module detection
+
+1. Choosing the soft-thresholding power: analysis of network topology
+
+2&3. Co-expression similarity and adjacency and Topological Overlap Matrix (TOM)
+```{r, fig.width=8, fig.height=5}
+Adjacency_TOM <- function(dataset=datExpr,
+                          sfpower=5){
+  # dataset=datExpr
+  # sfpower=5
+  
+  adjacency <- adjacency(datExpr, power = sfpower)
+  # Turn adjacency into topological overlap
+  TOM <- TOMsimilarity(adjacency)
+  dissTOM <- 1 - TOM
+  
+  ADJ_cor <- abs(WGCNA::cor(dataset, use = "p" )) ^ sfpower
+  k <- as.vector(apply(ADJ_cor, 2, sum, na.rm=T))
+  
+  # plot
+  sizeGrWindow(10, 5)
+  par(mfrow=c(1, 2))
+  hist(k)
+  scaleFreePlot(k, main="Check Scale free topology\n")
+  
+  res <- list(ADJ_cor=ADJ_cor,
+              dissTOM=dissTOM)
+  
+  return(res)
+}
+
+if(!dir.exists("../../Result/WGCNA")){
+  dir.create("../../Result/WGCNA", recursive = T)
+}
+
+dat_ADJ_TOM <- Adjacency_TOM(dataset=datExpr, sfpower=5)
+saveRDS(dat_ADJ_TOM, "../../Result/WGCNA/HNSC_WGCNA_ImmuneGene_ADJ_TOM.RDS", compress = TRUE)
+```
+
+4&5. Clustering using TOM and Merging of modules whose expression profiles are very similar
+```{r}
+Cluster_TOM <- function(dataset=datExpr,
+                        datTOM=dat_ADJ_TOM$dissTOM){
+  
+  # dataset=datExpr
+  # datTOM=dat_ADJ_TOM$dissTOM
+  
+  # Call the hierarchical clustering function
+  geneTree <- hclust(as.dist(datTOM), method = "average")
+  # Plot the resulting clustering tree (dendrogram)
+  sizeGrWindow(12, 9)
+  plot(geneTree, 
+       xlab="", 
+       sub="", 
+       main = "Gene clustering on TOM-based dissimilarity",
+       labels = FALSE, hang = 0.04)
+  
+  # We like large modules, so we set the minimum module size relatively high:
+  minModuleSize = 30
+  # Module identification using dynamic tree cut:
+  dynamicMods <- cutreeDynamic(dendro = geneTree, 
+                               distM = datTOM,
+                               deepSplit = 2, 
+                               pamRespectsDendro = FALSE,
+                               minClusterSize = minModuleSize)
+  # Convert numeric labels into colors
+  dynamicColors <- labels2colors(dynamicMods)
+  table(dynamicColors)
+  # Plot the dendrogram and colors underneath
+  sizeGrWindow(8, 6)
+  plotDendroAndColors(geneTree, 
+                      dynamicColors, 
+                      "Dynamic Tree Cut",
+                      dendroLabels = FALSE, 
+                      hang = 0.03,
+                      addGuide = TRUE, 
+                      guideHang = 0.05,
+                      main = "Gene dendrogram and module colors")
+  
+  # Calculate eigengenes
+  MEList <- moduleEigengenes(dataset, colors = dynamicColors)
+  MEs <- MEList$eigengenes
+  # Calculate dissimilarity of module eigengenes
+  MEDiss <- 1 - cor(MEs)
+  # Cluster module eigengenes
+  METree <- hclust(as.dist(MEDiss), method = "average");
+  # Plot the result
+  plotEigengeneNetworks(MEs, 
+                        "Eigengene adjacency heatmap", 
+                        marHeatmap = c(3, 4, 2, 2), 
+                        plotDendrograms = FALSE, 
+                        xLabelsAngle = 90)
+  
+  MEDissThres <- 0.25
+  # Plot the cut line into the dendrogram
+  abline(h = MEDissThres, col = "red")
+  # Call an automatic merging function
+  merge <- mergeCloseModules(dataset, dynamicColors, cutHeight = MEDissThres, verbose = 3)
+  # The merged module colors
+  mergedColors <- merge$colors
+  # Eigengenes of the new merged modules:
+  mergedMEs <- merge$newMEs
+  
+  sizeGrWindow(12, 9)
+  plotDendroAndColors(geneTree, cbind(dynamicColors, mergedColors),
+                      c("Dynamic Tree Cut", "Merged dynamic"),
+                      dendroLabels = FALSE, hang = 0.03,
+                      addGuide = TRUE, guideHang = 0.05) 
+  
+  
+  # results 
+  # Rename to moduleColors
+  moduleColors <- mergedColors
+  # Construct numerical labels corresponding to the colors
+  colorOrder <- c("grey", standardColors(50))
+  moduleLabels <- match(moduleColors, colorOrder) - 1
+  MEs <- mergedMEs
+  
+  res <- list(MEs=MEs,
+              METree=METree,
+              moduleLabels=moduleLabels,
+              moduleColors=moduleColors,
+              geneTree=geneTree)
+  
+  return(res)
+}
+
+if(!dir.exists("../../Result/WGCNA")){
+  dir.create("../../Result/WGCNA", recursive = T)
+}
+
+dat_module <- Cluster_TOM(dataset=datExpr, datTOM=dat_ADJ_TOM$dissTOM)
+saveRDS(dat_module, "../../Result/WGCNA/HNSC_WGCNA_ImmuneGene_module.RDS", compress = TRUE)
+```
+
+
+```{r}
+TOMplot_heatmap <- function(dataset=datExpr,
+                            sfpower=5,
+                            datTOM=dat_ADJ_TOM$dissTOM,
+                            nfeature=100,
+                            datModule=dat_module){
+  
+  # dataset=datExpr
+  # sfpower=5
+  # datTOM=dat_ADJ_TOM$dissTOM
+  # nfeature=100
+  # datModule=dat_module
+  
+  
+  # For reproducibility, we set the random seed 
+  set.seed(10)
+  select <- sample(ncol(dataset), size = nfeature)
+  selectTOM <- datTOM[select, select]
+  # There's no simple way of restricting a clustering tree to a subset of genes, so we must re-cluster. 
+  selectTree <- hclust(as.dist(selectTOM), method = "average") 
+  selectColors <- datModule$moduleColors[select] 
+  # Open a graphical window 
+  sizeGrWindow(9,9) 
+  # Taking the dissimilarity to a power, say 10, makes the plot more informative by effectively changing 
+  # the color palette; setting the diagonal to NA also improves the clarity of the plot 
+  plotDiss = selectTOM ^ sfpower
+  diag(plotDiss) = NA
+  TOMplot(plotDiss, 
+          selectTree, 
+          selectColors, 
+          main = "Network heatmap plot, selected genes")
+}
+
+TOMplot_heatmap(dataset=datExpr, nfeature=100)
+```
+
+```{r}
+heatmap_module_gene <- function(dataset=datExpr,
+                                datModule=dat_module,
+                                module="yellow"){
+  
+  # datModule=dat_module
+  # module="yellow"  
+  
+  which.module <- module
+  datME <- moduleEigengenes(dataset, datModule$moduleColors)$eigengenes
+  ME <- datME[, paste("ME", which.module, sep="")]
+  par(mfrow=c(2, 1), mar=c(0, 4.1, 4, 2.05))
+  plotMat(t(scale(datExpr[, datModule$moduleColors==which.module])),
+          nrgcols=30, 
+          rlabels=F,
+          rcols=which.module,
+          main=which.module, 
+          cex.main=2)
+  par(mar=c(2, 2.3, 0.5, 0.8))
+  barplot(ME, 
+          col=which.module, 
+          main="", 
+          cex.main=2,
+          ylab="eigengene expression",
+          xlab="array sample")  
+  
+}
+heatmap_module_gene(module="yellow")
+
+plot(dat_module$METree,
+     main = "Clustering of module eigengenes",
+     xlab = "", 
+     sub = "")
+```
+
+
+### Investigating modules related to external information
+```{r}
+module_relate_extra <- function(dataset=datExpr,
+                                metadata=datTraits,
+                                datModule=dat_module){
+  
+  # dataset=datExpr
+  # metadata=datTraits
+  # datModule=dat_module$MEs  
+  
+  
+  moduleTraitCor <- cor(datModule$MEs, metadata[, 1:3], use = "p")
+  moduleTraitPvalue <- corPvalueStudent(moduleTraitCor, nrow(dataset)) 
+  textMatrix <- paste(signif(moduleTraitCor, 2), "\n(", signif(moduleTraitPvalue, 1), ")", sep = "")
+  par(mar = c(10, 8.5, 3, 3))
+  labeledHeatmap(Matrix = moduleTraitCor, 
+                 xLabels = names(metadata[, 1:3]), 
+                 yLabels = names(datModule$MEs), 
+                 ySymbols = names(datModule$MEs), 
+                 colorLabels = FALSE, 
+                 colors = blueWhiteRed(50), 
+                 textMatrix = textMatrix,
+                 setStdMargins = FALSE, 
+                 cex.text = 0.65, 
+                 zlim = c(-1,1), 
+                 main = paste("Module-trait relationships"))
+  
+  
+  
+}
+module_relate_extra(dataset=datExpr, metadata=datTraits, datModule=dat_module)
+```
+
+#### Measure of module significance as average gene significance
+```{r}
+module_signif <- function(dataset=datExpr,
+                          metadata=datTraits,
+                          datModule=dat_module,
+                          group="Group"){
+  # dataset=datExpr
+  # metadata=datTraits
+  # datModule=dat_module
+  # group="Group"
+
+  GS1 <- as.numeric(WGCNA::cor(metadata %>% dplyr::select(group), dataset, use="p", method="pearson"))
+  GeneSignificance <- abs(GS1)
+  ModuleSignificance <- tapply(GeneSignificance, datModule$moduleColors, mean, na.rm=T)
+  ModuleSignificance
+  which.max(ModuleSignificance[names(ModuleSignificance) != "grey"])
+  
+  sizeGrWindow(8,7)
+  par(mfrow = c(1,1))
+  plotModuleSignificance(GeneSignificance, datModule$moduleColors)  
+    
+}
+module_signif(datModule=dat_module)
+```
+
+
+### Studying module relations via Eigengene Network
+
+Module membership, intramodular connectivity and screening for intramodular hub genes
+```{r, fig.width=8, fig.height=5}
+dat_module <- readRDS("../../Result/WGCNA/HNSC_WGCNA_ImmuneGene_module.RDS")
+get_HubGenes <- function(dataset=datExpr,
+                            metadata=datTraits,
+                            datModule=dat_module,
+                            sfpower=5,
+                            gs_cutoff=0.2,
+                            ic_cutoff=0.4,
+                            mcolor="brown",
+                            group="Group"){
+  
+  # dataset=datExpr
+  # metadata=datTraits
+  # datModule=dat_module
+  # sfpower=5
+  # gs_cutoff=0.2
+  # ic_cutoff=0.4
+  # mcolor="brown"
+  # group="Group"
+  
+  
+  #0 average gene significance
+  GS1 <- as.numeric(WGCNA::cor(metadata %>% dplyr::select(group), dataset, use="p", method="pearson"))
+  GeneSignificance <- abs(GS1) 
+  
+  #1 Intramodular connectivity
+  ADJ1 <- abs(cor(dataset, use="p")) ^ sfpower
+  Alldegrees1 <- intramodularConnectivity(ADJ1, datModule$moduleColors)
+  head(Alldegrees1, 2)
+  
+  #2 Relationship between gene significance and intramodular connectivity
+  colorlevels <- unique(dat_module$moduleColors)
+  sizeGrWindow(9, 6)
+  par(mfrow=c(2, as.integer(0.5 + length(colorlevels)/2)))
+  par(mar=c(4, 5, 3, 1))
+  for(i in c(1:length(colorlevels))){
+    whichmodule <- colorlevels[[i]]
+    restrict1 <- (dat_module$moduleColors == whichmodule)
+    verboseScatterplot(Alldegrees1$kWithin[restrict1],
+                       GeneSignificance[restrict1], 
+                       col=dat_module$moduleColors[restrict1],
+                       main=whichmodule,
+                       xlab="Connectivity",
+                       ylab="Gene Significance", 
+                       abline=TRUE)
+  }  
+    
+  #3 Generalizing intramodular connectivity for all genes on the array
+  datME <- moduleEigengenes(dataset, dat_module$moduleColors)$eigengenes
+  datKME <- signedKME(dataset, datME, outputColumnName="MM.")
+  head(datKME, 2)
+  
+  #4 Finding genes with high gene significance and high intramodular connectivity in interesting modules
+  dat_index <- data.frame(feature=colnames(dataset),
+                          gs_value=GS1,
+                          ic_value=datKME[, grep(mcolor, colnames(datKME))]) %>%
+    filter(abs(gs_value) > gs_cutoff) %>%
+    filter(abs(ic_value) > ic_cutoff) %>%
+    arrange(desc(abs(gs_value)))
+  
+  
+  #5 Relationship between the module membership measures (e.g. MM.turquoise) and intramodular connectivity
+  sizeGrWindow(8, 6)
+  par(mfrow=c(1, 2))
+  which.color <- "brown"
+  restrictGenes <- datModule$moduleColors==which.color
+  verboseScatterplot(Alldegrees1$kWithin[restrictGenes],
+                     (datKME[restrictGenes, paste("MM.", which.color, sep="")])^6,
+                     col=which.color,
+                     xlab="Intramodular Connectivity",
+                     ylab="(Module Membership)^5")
+  
+  which.color <- "yellow"
+  restrictGenes <- datModule$moduleColors==which.color
+  verboseScatterplot(Alldegrees1$kWithin[restrictGenes],
+                     (datKME[restrictGenes, paste("MM.", which.color, sep="")])^6,
+                     col=which.color,
+                     xlab="Intramodular Connectivity",
+                     ylab="(Module Membership)^5")  
+  
+  #6 Gene screening method based on a detailed definition module membership
+  y <- metadata %>% dplyr::select(group) %>% setNames("Y_value")
+  NS1 <- networkScreening(y=y$Y_value, 
+                          datME=datME, 
+                          datExpr=dataset,
+                          oddPower=3, 
+                          blockSize=1000, 
+                          minimumSampleSize=4,
+                          addMEy=TRUE, 
+                          removeDiag=FALSE, 
+                          weightESy=0.5)
+
+  sizeGrWindow(7, 7)
+  topList <- rank(NS1$p.Weighted, ties.method="first") <= 30
+  gene.names <- colnames(dataset)[topList]
+  # The following shows the correlations between the top genes
+  plotNetworkHeatmap(dataset, 
+                     plotGenes = gene.names,
+                     networkType="unsigned", 
+                     useTOM=TRUE,
+                     power=sfpower, 
+                     main="D. TOM in an unsigned network")
+  
+  res <- list(hubGenes=dat_index,
+              GS=GS1,
+              IC=datKME,
+              NS=NS1)
+  return(res)
+}
+
+if(!dir.exists("../../Result/WGCNA")){
+  dir.create("../../Result/WGCNA", recursive = T)
+}
+
+hubgene_brown <- get_HubGenes(gs_cutoff=0.2, ic_cutoff=0.4, mcolor="brown", group="Group")
+saveRDS(hubgene_brown, "../../Result/WGCNA/HNSC_WGCNA_ImmuneGene_HubGene_brown.RDS", compress = TRUE)
+
+hubgene_yellow <- get_HubGenes(gs_cutoff=0.2, ic_cutoff=0.4, mcolor="yellow", group="Group")
+saveRDS(hubgene_yellow, "../../Result/WGCNA/HNSC_WGCNA_ImmuneGene_HubGene_yellow.RDS", compress = TRUE)
+```
+
+
+### Exporting network data to network visualization software
+```{r}
+Export_NetData <- function(dataset=datExpr,
+                           sfpower=5,
+                           datModule=dat_module,
+                           nTopHub=50,
+                           modules=c("brown", "yellow")){
+  
+  # dataset=datExpr
+  # sfpower=5
+  # datModule=dat_module
+  # nTopHub=50
+  # modules=c("brown", "yellow")
+  
+  # Recalculate topological overlap if needed
+  TOM <- TOMsimilarityFromExpr(datExpr, power = 6)
+  # Select modules
+  modules <- c("brown", "yellow")
+  # Select module probes
+  probes <- colnames(datExpr)
+  inModule <- is.finite(match(dat_module$moduleColors, modules))
+  modProbes <- probes[inModule]
+  # Select the corresponding Topological Overlap
+  modTOM <- TOM[inModule, inModule]
+  IMConn <- softConnectivity(datExpr[, modProbes])
+  top <- (rank(-IMConn) <= nTopHub)
+  modProbes_top <- modProbes[top]
+  modTOM_top <- modTOM[top, top]
+  inModule_top <- dat_module$moduleColors[inModule][top]
+  dimnames(modTOM_top) <- list(modProbes_top, modProbes_top)
+  
+  cyt <- exportNetworkToCytoscape(modTOM_top,
+                                  edgeFile = paste("../../Result/WGCNA/CytoscapeInput-edges-", 
+                                                   paste(modules, collapse="-"), ".txt", sep=""),
+                                  nodeFile = paste("../../Result/WGCNA/CytoscapeInput-nodes-", 
+                                                   paste(modules, collapse="-"), ".txt", sep=""),
+                                  weighted = TRUE,
+                                  threshold = 0.02,
+                                  nodeNames = modProbes_top,
+                                  altNodeNames = modProbes_top,
+                                  nodeAttr = inModule_top) 
+  
+  return(cyt)
+    
+}
+
+if(!dir.exists("../../Result/WGCNA")){
+  dir.create("../../Result/WGCNA", recursive = T)
+}
+
+dat_cyt <- Export_NetData(nTopHub=100, modules=c("brown", "yellow"))
+saveRDS(dat_cyt, "../../Result/WGCNA/HNSC_WGCNA_ImmuneGene_Cytoscape.RDS", compress = TRUE)
+```
+
+
+### systemic information
+```{r}
+sessionInfo()
+```
+
+
+### Reference
+
+1. [WGCNA分析，简单全面的最新教程](https://www.jianshu.com/p/e9cc3f43441d)
+
+2. [WGCNA实例分析及解读（附代码）](https://www.jianshu.com/p/25905a905086)
+
+3. [Tutorials for the WGCNA package](https://horvath.genetics.ucla.edu/html/CoexpressionNetwork/Rpackages/WGCNA/Tutorials/index.html)
+
+4. [WGCNA包的blockwiseModules函数debug](https://www.jianshu.com/p/5b124641e4bc)
+
+5. [TCGA 数据分析实战 —— WGCNA](https://www.jianshu.com/p/b24e5f52a7a7)

@@ -1,0 +1,176 @@
+---
+title: "survival-associated immune-related hub genes"
+date: "Created: 2021-09-01 Updated: `r Sys.Date()`"
+output: 
+  html_notebook:
+    codes: hide
+---
+
+### Introdution
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = F, message = F)
+library(dplyr)
+library(tibble)
+library(convert)
+library(ggplot2)
+library(survival)
+library(survminer)
+library(data.table)
+library(maxstat)
+
+# rm(list = ls())
+options(stringsAsFactors = F)
+options(future.globals.maxSize = 1000 * 1024^2)
+
+grp <- c("Normal", "Tumor")
+grp.col <- c("#568875", "#73FAFC")
+```
+
+
+### Importing data 
+```{r}
+HNSC_ExprSet_Immune <- readRDS("../../Result/Profile/HNSC_ExprSet_ImmuneGene.RDS")
+HNSC_ExprSet_Immune
+
+HubGene <- fread("../../Result/WGCNA/CytoscapeInput-nodes-brown-yellow-degrees.csv")
+```
+
+
+### survival-associated immune-related hub genes
+```{r}
+get_SurHubGene <- function(dataset=HNSC_ExprSet_Immune,
+                           genelist=HubGene,
+                           ntop=50,
+                           Pval=0.05){
+
+  # dataset=HNSC_ExprSet_Immune  
+  # genelist=HubGene
+  # ntop=50
+  # Pval=0.2
+  
+  gene_top <- genelist %>% arrange(desc(degree.layout)) %>%
+    dplyr::slice(1:ntop) %>%
+    dplyr::select(name, degree.layout) %>%
+    setNames(c("GeneID", "Degree"))
+  
+  profile <- exprs(dataset) %>% data.frame()
+  phenotype <- pData(dataset)
+  
+  prof <- profile[gene_top$GeneID, ]
+  
+  mdat <- phenotype %>% rownames_to_column("Barcode") %>%
+    inner_join(t(prof) %>% data.frame() %>% rownames_to_column("Barcode"),
+               by = "Barcode") %>%
+    dplyr::select(-SampleID) %>%
+    filter(Group!=grp[1]) %>% 
+    column_to_rownames("Barcode") 
+  
+  datphe <- mdat %>% dplyr::select(OS.Time, OS) 
+  datprf <- mdat %>% dplyr::select(rownames(prof)) 
+  
+  sur_res <- apply(datprf, 2, function(x, y){ 
+    dat <- cbind(y, Value=x)
+    #dat <- cbind(datphe, Value=datprf$ESRRG)
+    fit <- maxstat.test(Surv(OS.Time, OS) ~ Value, 
+                        data = dat, 
+                        smethod = "LogRank", 
+                        pmethod = "Lau92") 
+    statistic <- as.numeric(fit$statistic)
+    pvalue <- as.numeric(fit$p.value)
+    cutpoint <- as.numeric(fit$estimate)
+    res <- c(statistic, pvalue, cutpoint)
+    return(res)
+    
+    }, datphe) %>% t() %>% data.frame() %>%
+    setNames(c("Statistic", "P.value", "Estimated_cutpoint")) %>%
+    rownames_to_column("GeneID") 
+  
+  res <- sur_res %>% inner_join(gene_top, by = "GeneID") %>%
+    mutate(Status=ifelse(P.value < 0.2, "Remain", "Discard"))
+  
+  return(res)
+}
+
+
+if(!dir.exists("../../Result/Survival")){
+  dir.create("../../Result/Survival", recursive = T)
+}
+
+survival_hubgene <- get_SurHubGene(dataset=HNSC_ExprSet_Immune, Pval=0.2)
+write.csv(survival_hubgene, "../../Result/Survival/HNSC_SurHubGene.csv", row.names = F)
+DT::datatable(survival_hubgene)
+```
+
+
+### Optimal cut-off value for each hub gene
+```{r}
+get_cutpoint <- function(dataset=HNSC_ExprSet_Immune,
+                         genelist=HubGene,
+                         ntop=50){
+
+  # dataset=HNSC_ExprSet_Immune
+  # genelist=HubGene
+  # ntop=50
+  
+  gene_top <- genelist %>% arrange(desc(degree.layout)) %>%
+    dplyr::slice(1:ntop) %>%
+    dplyr::select(name, degree.layout) %>%
+    setNames(c("GeneID", "Degree"))
+  
+  profile <- exprs(dataset) %>% data.frame()
+  phenotype <- pData(dataset)
+  
+  prof <- profile[gene_top$GeneID, ]
+  
+  mdat <- phenotype %>% rownames_to_column("Barcode") %>%
+    inner_join(t(prof) %>% data.frame() %>% rownames_to_column("Barcode"),
+               by = "Barcode") %>%
+    dplyr::select(-SampleID) %>%
+    filter(Group!=grp[1]) %>% 
+    column_to_rownames("Barcode") 
+  
+  datphe <- mdat %>% dplyr::select(OS.Time, OS)
+  datprf <- mdat %>% dplyr::select(rownames(prof))
+  
+  covariables <- colnames(datprf)
+  res_threshold <- lapply(covariables, function(x){
+    fit <- surv_cutpoint(data = mdat,
+                         time = "OS.Time",
+                         event = "OS",
+                         variables = x)
+    res <- as.numeric(summary(fit))
+    return(res)
+  }) %>% data.frame() %>% t() %>%
+    data.frame() %>%
+    setNames(c("cutpoint", "statistic"))
+  rownames(res_threshold) <- covariables
+  
+  
+  res <- res_threshold %>% rownames_to_column("GeneID")
+  
+  return(res)
+}
+
+if(!dir.exists("../../Result/Survival")){
+  dir.create("../../Result/Survival", recursive = T)
+}
+
+hubgene_cutoff <- get_cutpoint(dataset=HNSC_ExprSet_Immune)
+DT::datatable(hubgene_cutoff)
+```
+
+
+**Notes: the values of estimated_cutpoint in survival_hubgene equal to the values of cutpoint in hubgene_cutoff**
+
+
+### systemic information
+```{r}
+sessionInfo()
+```
+
+
+### Reference
+
+1. [Maximally Selected Rank and Statistics](https://www.rdocumentation.org/packages/maxstat/versions/0.7-24/topics/maxstat.test)
+
+2. [Determine optimal cutpoints for numerical variables in survival plots](http://r-addict.com/2016/11/21/Optimal-Cutpoint-maxstat.html)

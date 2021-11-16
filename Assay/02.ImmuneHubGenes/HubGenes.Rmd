@@ -1,0 +1,189 @@
+---
+title: "WGCNA: Immune-related hub Differential Expression Genes"
+date: "Created: 2021-08-20 Updated: `r Sys.Date()`"
+output: 
+  html_notebook:
+    codes: hide
+---
+
+### Introdution
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = F, message = F)
+library(dplyr)
+library(tibble)
+library(convert)
+library(ggplot2)
+library(WGCNA)
+
+# rm(list = ls())
+options(stringsAsFactors = F)
+options(future.globals.maxSize = 1000 * 1024^2)
+
+grp <- c("Normal", "Tumor")
+grp.col <- c("#568875", "#73FAFC")
+```
+
+
+### Importing Data 
+```{r}
+HNSC_ExprSet_Immune <- readRDS("../../Result/Profile/HNSC_ExprSet_ImmuneGene.RDS")
+```
+
+
+### Immune-related hub gene by using WGCNA analysis
+```{r}
+allowWGCNAThreads()
+ALLOW_WGCNA_THREADS = 10
+memory.limit(size = 200000)
+
+# parameters
+type <- "unsigned"
+corType <- "pearson"
+maxPOutliers <- ifelse(corType=="pearson", 1, 0.05)
+robustY <- ifelse(corType=="pearson",T,F)
+
+dataExpr <- exprs(HNSC_ExprSet_Immune)
+# phenotype <- pData(HNSC_immune_ExprSet)
+
+# Data filter
+m.mad <- apply(dataExpr, 1, mad)
+# dataExprVar <- dataExpr[which(m.mad > max(quantile(m.mad, probs=seq(0, 1, 0.25))[2], 0.01)), ]
+dataExprVar <- dataExpr[which(m.mad > 0), ]
+dataExpr <- as.data.frame(t(dataExprVar))
+
+# Missing value checking
+gsg <- goodSamplesGenes(dataExpr, verbose = 3)
+if (!gsg$allOK){
+  # Optionally, print the gene and sample names that were removed:
+  if (sum(!gsg$goodGenes) > 0) 
+    printFlush(paste("Removing genes:", 
+                     paste(names(dataExpr)[!gsg$goodGenes], collapse = ",")));
+  if (sum(!gsg$goodSamples)>0) 
+    printFlush(paste("Removing samples:", 
+                     paste(rownames(dataExpr)[!gsg$goodSamples], collapse = ",")));
+  # Remove the offending genes and samples from the data:
+  dataExpr <- dataExpr[gsg$goodSamples, gsg$goodGenes]
+}
+
+nGenes <- ncol(dataExpr)
+nSamples <- nrow(dataExpr)
+
+dim(dataExpr)
+```
+```{r}
+# outlier of samples
+sampleTree <- hclust(dist(dataExpr), method = "average")
+plot(sampleTree, main = "Sample clustering to detect outliers", sub="", xlab="")
+
+powers <- c(c(1:10), seq(from = 12, to=30, by=2))
+sft <- pickSoftThreshold(dataExpr, powerVector=powers, networkType=type, verbose=5)
+par(mfrow = c(1,2))
+cex1 <- 0.9
+plot(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+     xlab="Soft Threshold (power)",
+     ylab="Scale Free Topology Model Fit,signed R^2",type="n",
+     main = paste("Scale independence"))
+text(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+     labels=powers,cex=cex1,col="red")
+abline(h=0.85, col="red")
+
+plot(sft$fitIndices[,1], sft$fitIndices[,5],
+     xlab="Soft Threshold (power)",ylab="Mean Connectivity", type="n",
+     main = paste("Mean connectivity"))
+text(sft$fitIndices[,1], sft$fitIndices[,5], labels=powers, cex=cex1, col="red")
+```
+
+```{r}
+power <- sft$powerEstimate
+power
+
+if(is.na(power)){
+  power <- ifelse(nSamples<20, ifelse(type == "unsigned", 9, 18),
+            ifelse(nSamples<30, ifelse(type == "unsigned", 8, 16),
+            ifelse(nSamples<40, ifelse(type == "unsigned", 7, 14),
+            ifelse(type == "unsigned", 6, 12))       
+            )
+          )
+}
+```
+
+```{r}
+net <- blockwiseModules(dataExpr, 
+                        power = power, 
+                        maxBlockSize = nGenes,
+                        TOMType = type, 
+                        minModuleSize = 30,
+                        reassignThreshold = 0, 
+                        mergeCutHeight = 0.25,
+                        numericLabels = TRUE, 
+                        pamRespectsDendro = FALSE,
+                        saveTOMs=TRUE, 
+                        corType = corType, 
+                        maxPOutliers = maxPOutliers, 
+                        loadTOMs = TRUE,
+                        saveTOMFileBase = paste0("HSNC_ImmuneGenes", ".tom"), 
+                        verbose = 3)
+table(net$colors)
+```
+```{r}
+moduleLabels <- net$colors
+moduleColors <- labels2colors(moduleLabels)
+plotDendroAndColors(net$dendrograms[[1]], 
+                    moduleColors[net$blockGenes[[1]]],
+                    "Module colors",
+                    dendroLabels = FALSE, hang = 0.03,
+                    addGuide = TRUE, guideHang = 0.05)
+```
+
+```{r}
+MEs <- net$MEs
+MEs_col <- MEs
+colnames(MEs_col) <- paste0("ME", labels2colors(as.numeric(stringr::str_replace_all(colnames(MEs), "ME", ""))))
+MEs_col <- orderMEs(MEs_col)
+plotEigengeneNetworks(MEs_col, 
+                      "Eigengene adjacency heatmap", 
+                      marDendro = c(3,3,2,4),
+                      marHeatmap = c(3,4,2,2), 
+                      plotDendrograms = T, 
+                      xLabelsAngle = 90)
+```
+
+
+```{r}
+load(net$TOMFiles[1], verbose=T)
+TOM <- as.matrix(TOM)
+dissTOM <- 1-TOM
+plotTOM <-  dissTOM^7
+diag(plotTOM) <- NA
+TOMplot(plotTOM, net$dendrograms, moduleColors, 
+        main = "Network heatmap plot, all genes")
+```
+
+
+```{r}
+probes <- colnames(dataExpr)
+dimnames(TOM) <- list(probes, probes)
+cyt <- exportNetworkToCytoscape(TOM,
+             edgeFile = paste("HSNC_ImmuneGenes", ".edges.txt", sep=""),
+             nodeFile = paste("HSNC_ImmuneGenes", ".nodes.txt", sep=""),
+             weighted = TRUE, 
+             threshold = 0,
+             nodeNames = probes, 
+             nodeAttr = moduleColors)
+```
+
+
+### systemic information
+```{r}
+sessionInfo()
+```
+
+
+### Reference
+
+1. [WGCNA分析，简单全面的最新教程](https://www.jianshu.com/p/e9cc3f43441d)
+
+2. [WGCNA实例分析及解读（附代码）](https://www.jianshu.com/p/25905a905086)
+
+3. [Tutorials for the WGCNA package](https://horvath.genetics.ucla.edu/html/CoexpressionNetwork/Rpackages/WGCNA/Tutorials/index.html)
+
